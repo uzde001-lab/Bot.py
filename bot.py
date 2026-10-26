@@ -59,8 +59,10 @@ PARALLEL_CHUNKS = 5
 MAX_VIDEO_MINUTES = 180
 MAX_PARALLEL_JOBS = 2
 DAILY_LIMIT = 8
-WHISPER_MODEL = "whisper-large-v3-turbo"   # aniqroq: "whisper-large-v3"
-LLM_MODEL = "llama-3.3-70b-versatile"
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-large-v3")  # aniq; tezroq/arzonroq: "whisper-large-v3-turbo"
+LLM_MODELS = [m for m in (os.getenv("LLM_MODEL"), "openai/gpt-oss-120b", "openai/gpt-oss-20b") if m]
+TG_DL_WORKERS = int(os.getenv("TG_DL_WORKERS", "6"))   # MTProto parallel yuklash oqimlari
+MAX_CHUNK_BYTES = 24 * 1024 * 1024                     # Groq: bitta fayl 25 MB dan oshmasin
 LLM_PART_CHARS = 8000
 TG_FILE_LIMIT = 20 * 1024 * 1024           # oddiy Bot API chegarasi
 TG_API_ID = int(os.getenv("TG_API_ID", "0") or 0)      # my.telegram.org
@@ -86,7 +88,26 @@ pending: dict[str, dict] = {}
 
 ID_RE = re.compile(r"(?:youtube\.com/(?:watch\?(?:[^\s]*&)?v=|shorts/|live/|embed/)|youtu\.be/)([\w-]{11})")
 SENT_END = re.compile(r"[.!?…»\"”]$")
-LANGS = {"auto": "🌐 Avto", "uz": "🇺🇿 O'zbek", "ru": "🇷🇺 Rus", "en": "🇬🇧 Ingliz", "tr": "🇹🇷 Turk"}
+LANGS = {"auto": "🌐 Avto", "uz": "🇺🇿 O'zbek", "de": "🇩🇪 Nemis", "ru": "🇷🇺 Rus",
+         "en": "🇬🇧 Ingliz", "tr": "🇹🇷 Turk"}
+# Whisper'ga til bo'yicha ko'rsatma: imlo, tinish belgilari va yozuv (lotin) to'g'ri chiqishi uchun
+PROMPTS = {
+    "uz": "Assalomu alaykum! Bu o'zbek tilidagi suhbat. Matn lotin alifbosida, to'g'ri imlo va tinish belgilari bilan yoziladi.",
+    "de": "Hallo und herzlich willkommen! Dies ist ein deutsches Gespräch. Der Text wird mit korrekter Rechtschreibung und Zeichensetzung transkribiert.",
+    "ru": "Здравствуйте! Это разговор на русском языке. Текст записывается с правильной орфографией и пунктуацией.",
+    "en": "Hello and welcome. This is a conversation, transcribed with correct spelling and punctuation.",
+    "tr": "Merhaba! Bu bir Türkçe konuşmadır. Metin doğru yazım ve noktalama ile yazılır.",
+}
+LANG_NAME_TO_CODE = {
+    "uzbek": "uz", "german": "de", "russian": "ru", "english": "en", "turkish": "tr", "kazakh": "kk",
+    "tajik": "tg", "arabic": "ar", "persian": "fa", "french": "fr", "spanish": "es", "italian": "it",
+    "ukrainian": "uk", "azerbaijani": "az", "kyrgyz": "ky", "turkmen": "tk", "korean": "ko",
+    "chinese": "zh", "japanese": "ja", "hindi": "hi", "portuguese": "pt", "dutch": "nl", "polish": "pl",
+}
+# Whisper sukunat paytida to'qib chiqaradigan odatiy "hayoliy" jumlalar
+JUNK_RE = re.compile(r"amara\.org|untertitel|subtitles? by|thanks? for watching|thank you for watching|"
+                     r"dimatorzok|продолжение следует|субтитры|abonniert|vielen dank fürs zuschauen", re.I)
+
 CLIENT_ATTEMPTS = [None, ["tv"], ["android_vr"], ["web_safari"], ["mweb"]]
 FATAL_YT = ("Private video", "Video unavailable", "has been removed", "copyright", "members-only",
             "age-restricted", "This live event")
@@ -282,16 +303,54 @@ def download_audio(url: str, out_dir: str) -> str:
     raise last
 
 
-async def split_audio(src: str, out_dir: str) -> list[str]:
+COPY_MAP = {"aac": ("m4a", "mp4"), "mp3": ("mp3", "mp3"), "opus": ("ogg", "ogg"), "vorbis": ("ogg", "ogg")}
+
+
+async def _ffmpeg(*args) -> tuple[int, str]:
     proc = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-y", "-i", src, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "32k",
-        "-f", "segment", "-segment_time", str(CHUNK_SECONDS), "-reset_timestamps", "1",
-        os.path.join(out_dir, "chunk_%04d.mp3"),
+        "ffmpeg", "-y", "-loglevel", "error", *args,
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
     _, err = await proc.communicate()
-    if proc.returncode != 0:
-        raise RuntimeError(f"Audio o'qib bo'lmadi: {err.decode()[-200:]}")
-    files = sorted(os.path.join(out_dir, f) for f in os.listdir(out_dir) if f.startswith("chunk_"))
+    return proc.returncode, err.decode()[-200:]
+
+
+async def _probe_codec(src: str) -> str:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_name",
+            "-of", "csv=p=0", src, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await proc.communicate()
+        return out.decode().strip().split("\n")[0]
+    except Exception:
+        return ""
+
+
+def _chunks(out_dir: str) -> list[str]:
+    return sorted(os.path.join(out_dir, f) for f in os.listdir(out_dir) if f.startswith("chunk_"))
+
+
+async def split_audio(src: str, out_dir: str) -> list[str]:
+    """1) Audioni QAYTA KODLAMASDAN bo'laklarga bo'ladi (juda tez, CPU deyarli kerak emas).
+    2) Bo'lmasa yoki bo'lak juda katta bo'lsa - 32 kbps mono mp3 ga o'giradi."""
+    codec = await _probe_codec(src)
+    if codec in COPY_MAP:
+        ext, fmt = COPY_MAP[codec]
+        code, err = await _ffmpeg("-i", src, "-vn", "-map", "0:a:0", "-c:a", "copy", "-f", "segment",
+                                  "-segment_time", str(CHUNK_SECONDS), "-segment_format", fmt,
+                                  "-reset_timestamps", "1", os.path.join(out_dir, f"chunk_%04d.{ext}"))
+        files = _chunks(out_dir)
+        if code == 0 and files and all(os.path.getsize(f) <= MAX_CHUNK_BYTES for f in files):
+            log.info("Tez bo'lish (copy, %s): %d bo'lak", codec, len(files))
+            return files
+        log.warning("Copy-rejim o'tmadi (%s), qayta kodlanadi", err.strip()[:100])
+        for f in files:
+            os.remove(f)
+    code, err = await _ffmpeg("-i", src, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "32k",
+                              "-f", "segment", "-segment_time", str(CHUNK_SECONDS), "-reset_timestamps", "1",
+                              os.path.join(out_dir, "chunk_%04d.mp3"))
+    if code != 0:
+        raise RuntimeError(f"Audio o'qib bo'lmadi: {err}")
+    files = _chunks(out_dir)
     if not files:
         raise RuntimeError("Audioda ovoz topilmadi")
     return files
@@ -318,38 +377,55 @@ class Progress:
 
 
 # ---------------------- TRANSKRIPSIYA ----------------------
-def _transcribe_sync(path: str, lang: str) -> list[dict]:
+def _lang_code(name) -> str:
+    n = (name or "").strip().lower()
+    return LANG_NAME_TO_CODE.get(n) or (n if len(n) == 2 else "")
+
+
+def _is_junk(text: str, nsp: float, lp: float, prompt: str) -> bool:
+    if prompt and (text in prompt or prompt[:30] in text):
+        return True
+    if nsp > 0.8 and lp < -1.0:
+        return True
+    return bool(JUNK_RE.search(text)) and len(text) < 90 and (nsp > 0.3 or lp < -0.8)
+
+
+def _transcribe_sync(path: str, lang: str) -> tuple[list[dict], str]:
+    """(segmentlar, aniqlangan til kodi)"""
     with open(path, "rb") as f:
         data = f.read()
     kw = dict(file=(os.path.basename(path), data), model=WHISPER_MODEL,
               response_format="verbose_json", timestamp_granularities=["segment"], temperature=0.0)
+    prompt = ""
     if lang != "auto":
         kw["language"] = lang
+        prompt = PROMPTS.get(lang, "")
+        if prompt:
+            kw["prompt"] = prompt
     res = groq.audio.transcriptions.create(**kw)
-    segs = getattr(res, "segments", None)
-    if segs is None and isinstance(res, dict):
-        segs = res.get("segments")
+    get = (lambda o, k, d=None: o.get(k, d)) if isinstance(res, dict) else (lambda o, k, d=None: getattr(o, k, d))
+    segs = get(res, "segments") or []
+    detected = _lang_code(get(res, "language"))
     out = []
-    for s in segs or []:
+    for s in segs:
         g = (lambda k, d=None: s.get(k, d)) if isinstance(s, dict) else (lambda k, d=None: getattr(s, k, d))
         text = (g("text") or "").strip()
-        # "hayoliy matn" filtri: sukunat paytidagi bema'ni takrorlar
-        if not text or (g("no_speech_prob", 0) > 0.8 and g("avg_logprob", 0) < -1.0):
+        if not text or _is_junk(text, g("no_speech_prob", 0) or 0, g("avg_logprob", 0) or 0, prompt):
             continue
         out.append({"s": float(g("start")), "e": float(g("end")), "t": text})
-    return out
+    return out, detected
 
 
-async def transcribe_chunk(path: str, lang: str) -> list[dict]:
+async def transcribe_chunk(path: str, lang: str) -> tuple[list[dict], str]:
     if os.path.getsize(path) < 4096:      # juda qisqa bo'lak (oxirgi qoldiq)
-        return []
+        return [], ""
     async with chunk_sem:
         for attempt in range(6):
             try:
                 return await asyncio.to_thread(_transcribe_sync, path, lang)
             except BadRequestError as e:
                 log.warning("Bo'lak o'tkazib yuborildi: %s", str(e)[:120])
-                return []
+                return [], ""
             except RateLimitError:
                 log.warning("Groq limit, kutamiz (urinish %d)", attempt + 1)
                 await asyncio.sleep(15 * (attempt + 1))
@@ -369,16 +445,29 @@ async def transcribe_file(audio: str, lang: str, tmp: str, prog: Progress) -> li
     except OSError:
         pass
     done = 0
+    note = ""
 
-    async def run(i: int, f: str):
+    async def run(i: int, f: str, use_lang: str):
         nonlocal done
-        segs = await transcribe_chunk(f, lang)
+        segs, det = await transcribe_chunk(f, use_lang)
         done += 1
-        await prog.update(f"🎙 Matnga aylantirilmoqda ({done}/{len(files)})", 25 + 60 * done / len(files))
+        await prog.update(f"🎙 Matnga aylantirilmoqda ({done}/{len(files)}){note}", 25 + 60 * done / len(files))
         off = i * CHUNK_SECONDS
-        return [{"s": x["s"] + off, "e": x["e"] + off, "t": x["t"]} for x in segs]
+        return [{"s": x["s"] + off, "e": x["e"] + off, "t": x["t"]} for x in segs], det
 
-    parts = await asyncio.gather(*(run(i, f) for i, f in enumerate(files)))
+    if lang == "auto" and len(files) > 1:
+        # Tilni BIRINCHI bo'lakdan aniqlab, qolganlariga qat'iy qo'llaymiz (har bo'lakda til almashib ketmasin)
+        first, det = await run(0, files[0], "auto")
+        use = det or "auto"
+        if det:
+            note = f" · til: {LANGS.get(det, det)}"
+            log.info("Aniqlangan til: %s", det)
+        rest = await asyncio.gather(*(run(i, f, use) for i, f in enumerate(files) if i > 0))
+        parts = [first] + [r[0] for r in rest]
+    else:
+        res = await asyncio.gather(*(run(i, f, lang) for i, f in enumerate(files)))
+        parts = [r[0] for r in res]
+
     flat, prev = [], None
     for part in parts:
         for s in part:
@@ -429,16 +518,22 @@ def clean_md(s: str) -> str:
 
 # ---------------------- AI XULOSA ----------------------
 def _llm(system: str, text: str) -> str:
-    for attempt in range(4):
-        try:
-            r = groq.chat.completions.create(
-                model=LLM_MODEL, temperature=0.3, max_tokens=1200,
-                messages=[{"role": "system", "content": system}, {"role": "user", "content": text}])
-            return r.choices[0].message.content.strip()
-        except Exception as e:
-            log.warning("LLM xatosi: %s", str(e)[:120])
-            time.sleep(8 * (attempt + 1))
-    raise RuntimeError("LLM javob bermadi")
+    last = None
+    for attempt in range(5):
+        for model in LLM_MODELS:
+            try:
+                r = groq.chat.completions.create(
+                    model=model, temperature=0.3, max_tokens=3000,
+                    extra_body={"reasoning_effort": "low"},
+                    messages=[{"role": "system", "content": system}, {"role": "user", "content": text}])
+                out = (r.choices[0].message.content or "").strip()
+                if out:
+                    return out
+            except Exception as e:
+                last = e
+                log.warning("LLM xatosi (%s): %s", model, str(e)[:120])
+        time.sleep(6 * (attempt + 1))
+    raise RuntimeError(f"LLM javob bermadi: {str(last)[:100]}")
 
 
 def summarize(text: str) -> str:
@@ -658,6 +753,31 @@ async def handle_media(m: Message):
 
 
 # ---------------------- MTProto (Telethon): 20 MB dan katta fayllar ----------------------
+async def fast_download(client, media, path: str, size: int, progress=None, workers: int = TG_DL_WORKERS) -> None:
+    """Faylni bir nechta parallel oqim bilan yuklaydi (oddiy yuklashdan bir necha baravar tez)."""
+    req = 512 * 1024
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+    done = 0
+
+    async def worker(k: int):
+        nonlocal done
+        pos = k * req
+        async for chunk in client.iter_download(media, offset=pos, stride=workers * req,
+                                                request_size=req, file_size=size):
+            os.pwrite(fd, chunk, pos)
+            pos += workers * req
+            done += len(chunk)
+            if progress:
+                await progress(done, size)
+
+    try:
+        await asyncio.gather(*(worker(k) for k in range(workers)))
+    finally:
+        os.close(fd)
+    if os.path.getsize(path) != size:
+        raise RuntimeError("Fayl to'liq yuklanmadi")
+
+
 async def on_big_file(event):
     msg = event.message
     f = msg.file
@@ -680,8 +800,16 @@ async def on_big_file(event):
 
         async def fetch(path, prog):
             async def cb(cur, total):
-                await prog.update("⬇️ Fayl yuklanmoqda", 2 + 16 * (cur / total if total else 0))
-            await msg.download_media(file=path, progress_callback=cb)
+                await prog.update(f"⬇️ Fayl yuklanmoqda ({cur / 1048576:.0f}/{total / 1048576:.0f} MB)",
+                                  2 + 16 * (cur / total if total else 0))
+            t0 = time.monotonic()
+            try:
+                await asyncio.wait_for(fast_download(tg_client, msg.media, path, f.size, cb),
+                                       timeout=240 + f.size / (256 * 1024))
+                log.info("Tez yuklash: %.0f MB, %.0f s", f.size / 1048576, time.monotonic() - t0)
+            except Exception as e:   # zaxira: oddiy yuklash
+                log.warning("Tez yuklash o'tmadi (%s), oddiy usul", str(e)[:120])
+                await msg.download_media(file=path, progress_callback=cb)
 
         await run_upload(uid, status, key, f.name or "Audio", f.duration or 0, fetch)
     except Exception as e:
