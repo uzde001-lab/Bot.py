@@ -1,0 +1,9 @@
+aiogram>=3.4
+aiohttp
+yt-dlp[default]
+deno
+groq
+reportlab
+python-docx
+telethon
+cryptg
